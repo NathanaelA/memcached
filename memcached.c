@@ -3944,6 +3944,9 @@ static void drive_machine(conn *c) {
     int nreqs = settings.reqs_per_event;
     int res;
     const char *str;
+#ifdef USE_REPLICATION
+    int flags = 1;
+#endif
 #ifdef HAVE_ACCEPT4
     static int  use_accept4 = 1;
 #else
