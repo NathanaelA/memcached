@@ -193,6 +193,7 @@ static void stats_init(void) {
     stats.curr_items = stats.total_items = stats.curr_conns = stats.total_conns = stats.conn_structs = 0;
     stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = stats.evictions = stats.reclaimed = 0;
     stats.touch_cmds = stats.touch_misses = stats.touch_hits = stats.rejected_conns = 0;
+    stats.malloc_fails = 0;
     stats.curr_bytes = stats.listen_disabled_num = 0;
     stats.hash_power_level = stats.hash_bytes = stats.hash_is_expanding = 0;
     stats.expired_unfetched = stats.evicted_unfetched = 0;
@@ -212,6 +213,7 @@ static void stats_reset(void) {
     STATS_LOCK();
     stats.total_items = stats.total_conns = 0;
     stats.rejected_conns = 0;
+    stats.malloc_fails = 0;
     stats.evictions = 0;
     stats.reclaimed = 0;
     stats.listen_disabled_num = 0;
@@ -252,7 +254,10 @@ static void settings_init(void) {
     settings.rep_qmax = 8192;
 #endif /* USE_REPLICATION */
     settings.slab_reassign = false;
-    settings.slab_automove = false;
+    settings.slab_automove = 0;
+    settings.shutdown_command = false;
+    settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
+    settings.flush_enabled = true;
 }
 
 /*
@@ -268,8 +273,12 @@ static int add_msghdr(conn *c)
 
     if (c->msgsize == c->msgused) {
         msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
-        if (! msg)
+        if (! msg) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
             return -1;
+        }
         c->msglist = msg;
         c->msgsize *= 2;
     }
@@ -384,7 +393,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     if (NULL == c) {
         if (!(c = (conn *)calloc(1, sizeof(conn)))) {
-            fprintf(stderr, "calloc()\n");
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            fprintf(stderr, "Failed to allocate connection object\n");
             return NULL;
         }
         MEMCACHED_CONN_CREATE(c);
@@ -414,7 +426,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         if (c->rbuf == 0 || c->wbuf == 0 || c->ilist == 0 || c->iov == 0 ||
                 c->msglist == 0 || c->suffixlist == 0) {
             conn_free(c);
-            fprintf(stderr, "malloc()\n");
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            fprintf(stderr, "Failed to allocate buffers for connection\n");
             return NULL;
         }
 
@@ -474,6 +489,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->iovused = 0;
     c->msgcurr = 0;
     c->msgused = 0;
+    c->authenticated = false;
 
     c->write_and_go = init_state;
     c->write_and_free = 0;
@@ -706,8 +722,12 @@ static int ensure_iov_space(conn *c) {
         int i, iovnum;
         struct iovec *new_iov = (struct iovec *)realloc(c->iov,
                                 (c->iovsize * 2) * sizeof(struct iovec));
-        if (! new_iov)
+        if (! new_iov) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
             return -1;
+        }
         c->iov = new_iov;
         c->iovsize *= 2;
 
@@ -790,12 +810,18 @@ static int build_udp_headers(conn *c) {
 
     if (c->msgused > c->hdrsize) {
         void *new_hdrbuf;
-        if (c->hdrbuf)
+        if (c->hdrbuf) {
             new_hdrbuf = realloc(c->hdrbuf, c->msgused * 2 * UDP_HEADER_SIZE);
-        else
+        } else {
             new_hdrbuf = malloc(c->msgused * 2 * UDP_HEADER_SIZE);
-        if (! new_hdrbuf)
+        }
+
+        if (! new_hdrbuf) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
             return -1;
+        }
         c->hdrbuf = (unsigned char *)new_hdrbuf;
         c->hdrsize = c->msgused * 2;
     }
@@ -1137,12 +1163,16 @@ static void complete_incr_bin(conn *c) {
         if (req->message.body.expiration != 0xffffffff) {
             /* Save some room for the response */
             rsp->message.body.value = htonll(req->message.body.initial);
+
+            snprintf(tmpbuf, INCR_MAX_STORAGE_LEN, "%llu",
+                (unsigned long long)req->message.body.initial);
+            int res = strlen(tmpbuf);
             it = item_alloc(key, nkey, 0, realtime(req->message.body.expiration),
-                            INCR_MAX_STORAGE_LEN);
+                            res + 2);
 
             if (it != NULL) {
-                snprintf(ITEM_data(it), INCR_MAX_STORAGE_LEN, "%llu",
-                         (unsigned long long)req->message.body.initial);
+                memcpy(ITEM_data(it), tmpbuf, res);
+                memcpy(ITEM_data(it) + res, "\r\n", 2);
 
                 if (store_item(it, NREAD_ADD, c)) {
                     c->cas = ITEM_get_cas(it);
@@ -1248,8 +1278,8 @@ static void process_bin_touch(conn *c) {
     protocol_binary_response_get* rsp = (protocol_binary_response_get*)c->wbuf;
     char* key = binary_get_key(c);
     size_t nkey = c->binary_header.request.keylen;
-    protocol_binary_request_touch *t = (void *)&c->binary_header;
-    uint32_t exptime = ntohl(t->message.body.expiration);
+    protocol_binary_request_touch *t = binary_get_request(c);
+    time_t exptime = ntohl(t->message.body.expiration);
 
     if (settings.verbose > 1) {
         int ii;
@@ -1487,6 +1517,9 @@ static bool grow_stats_buf(conn *c, size_t needed) {
             c->stats.buffer = ptr;
             c->stats.size = nsize;
         } else {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
             rv = false;
         }
     }
@@ -1610,6 +1643,9 @@ static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
             }
             char *newm = realloc(c->rbuf, nsize);
             if (newm == NULL) {
+                STATS_LOCK();
+                stats.malloc_fails++;
+                STATS_UNLOCK();
                 if (settings.verbose) {
                     fprintf(stderr, "%d: Failed to grow buffer.. closing connection\n",
                             c->sfd);
@@ -1652,6 +1688,8 @@ static void init_sasl_conn(conn *c) {
     /* should something else be returned? */
     if (!settings.sasl)
         return;
+
+    c->authenticated = false;
 
     if (!c->sasl_conn) {
         int result=sasl_server_new("memcached",
@@ -1787,6 +1825,7 @@ static void process_bin_complete_sasl_auth(conn *c) {
 
     switch(result) {
     case SASL_OK:
+        c->authenticated = true;
         write_bin_response(c, "Authenticated", 0, 0, strlen("Authenticated"));
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.auth_cmds++;
@@ -1823,12 +1862,8 @@ static bool authenticated(conn *c) {
         rv = true;
         break;
     default:
-        if (c->sasl_conn) {
-            const void *uname = NULL;
-            sasl_getprop(c->sasl_conn, SASL_USERNAME, &uname);
-            rv = uname != NULL;
+        rv = c->authenticated;
         }
-    }
 
     if (settings.verbose > 1) {
         fprintf(stderr, "authenticated() in cmd 0x%02x is %s\n",
@@ -2171,6 +2206,12 @@ static void process_bin_flush(conn *c) {
     time_t exptime = 0;
     protocol_binary_request_flush* req = binary_get_request(c);
 
+    if (!settings.flush_enabled) {
+      // flush_all is not allowed but we log it on stats
+      write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, 0);
+      return;
+    }
+
     if (c->binary_header.request.extlen == sizeof(req->message.body)) {
         exptime = ntohl(req->message.body.expiration);
     }
@@ -2200,7 +2241,12 @@ static void process_bin_delete(conn *c) {
     assert(c != NULL);
 
     if (settings.verbose > 1) {
-        fprintf(stderr, "Deleting %s\n", key);
+        int ii;
+        fprintf(stderr, "Deleting ");
+        for (ii = 0; ii < nkey; ++ii) {
+            fprintf(stderr, "%c", key[ii]);
+    }
+        fprintf(stderr, "\n");
     }
 
     if (settings.detail_enabled) {
@@ -2376,7 +2422,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
 
                 flags = (int) strtol(ITEM_suffix(old_it), (char **) NULL, 10);
 
-                new_it = item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
+                new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */, hv);
 
                 if (new_it == NULL) {
                     /* SERVER_ERROR out of memory */
@@ -2636,8 +2682,6 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("hash_power_level", "%u", stats.hash_power_level);
     APPEND_STAT("hash_bytes", "%llu", (unsigned long long)stats.hash_bytes);
     APPEND_STAT("hash_is_expanding", "%u", stats.hash_is_expanding);
-    APPEND_STAT("expired_unfetched", "%llu", stats.expired_unfetched);
-    APPEND_STAT("evicted_unfetched", "%llu", stats.evicted_unfetched);
 #ifdef USE_REPLICATION
     APPEND_STAT("replication", "MASTER", 0);
     APPEND_STAT("repcached_version", "%s", REPCACHED_VERSION);
@@ -2647,12 +2691,14 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
         APPEND_STAT("slab_reassign_running", "%u", stats.slab_reassign_running);
         APPEND_STAT("slabs_moved", "%llu", stats.slabs_moved);
     }
+    APPEND_STAT("malloc_fails", "%llu",
+                (unsigned long long)stats.malloc_fails);
     STATS_UNLOCK();
 }
 
 static void process_stat_settings(ADD_STAT add_stats, void *c) {
     assert(add_stats);
-    APPEND_STAT("maxbytes", "%u", (unsigned int)settings.maxbytes);
+    APPEND_STAT("maxbytes", "%llu", (unsigned long long)settings.maxbytes);
     APPEND_STAT("maxconns", "%d", settings.maxconns);
     APPEND_STAT("tcpport", "%d", settings.port);
     APPEND_STAT("udpport", "%d", settings.udpport);
@@ -2680,7 +2726,9 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("maxconns_fast", "%s", settings.maxconns_fast ? "yes" : "no");
     APPEND_STAT("hashpower_init", "%d", settings.hashpower_init);
     APPEND_STAT("slab_reassign", "%s", settings.slab_reassign ? "yes" : "no");
-    APPEND_STAT("slab_automove", "%s", settings.slab_automove ? "yes" : "no");
+    APPEND_STAT("slab_automove", "%d", settings.slab_automove);
+    APPEND_STAT("tail_repair_time", "%d", settings.tail_repair_time);
+    APPEND_STAT("flush_enabled", "%s", settings.flush_enabled ? "yes" : "no");
 }
 
 static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
@@ -2791,6 +2839,9 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         c->isize *= 2;
                         c->ilist = new_list;
                     } else {
+                        STATS_LOCK();
+                        stats.malloc_fails++;
+                        STATS_UNLOCK();
                         item_remove(it);
                         break;
                     }
@@ -2816,6 +2867,9 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         c->suffixsize *= 2;
                         c->suffixlist  = new_suffix_list;
                     } else {
+                        STATS_LOCK();
+                        stats.malloc_fails++;
+                        STATS_UNLOCK();
                         item_remove(it);
                         break;
                     }
@@ -2823,6 +2877,9 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
                   suffix = cache_alloc(c->thread->suffix_cache);
                   if (suffix == NULL) {
+                      STATS_LOCK();
+                      stats.malloc_fails++;
+                      STATS_UNLOCK();
                     out_string(c, "SERVER_ERROR out of memory making CAS suffix");
                     item_remove(it);
                     return;
@@ -2855,8 +2912,14 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 }
 
 
-                if (settings.verbose > 1)
-                    fprintf(stderr, ">%d sending key %s\n", c->sfd, ITEM_key(it));
+                if (settings.verbose > 1) {
+                    int ii;
+                    fprintf(stderr, ">%d sending key ", c->sfd);
+                    for (ii = 0; ii < it->nkey; ++ii) {
+                        fprintf(stderr, "%c", key[ii]);
+                    }
+                    fprintf(stderr, "\n");
+                }
 
                 /* item_get() has incremented it->refcount for us */
                 pthread_mutex_lock(&c->thread->stats.mutex);
@@ -3160,9 +3223,22 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
 
     snprintf(buf, INCR_MAX_STORAGE_LEN, "%llu", (unsigned long long)value);
     res = strlen(buf);
-    if (res + 2 > it->nbytes || it->refcount != 1) { /* need to realloc */
+    /* refcount == 2 means we are the only ones holding the item, and it is
+     * linked. We hold the item's lock in this function, so refcount cannot
+     * increase. */
+    if (res + 2 <= it->nbytes && it->refcount == 2) { /* replace in-place */
+        /* When changing the value without replacing the item, we
+           need to update the CAS on the existing item. */
+        mutex_lock(&cache_lock); /* FIXME */
+        ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+        mutex_unlock(&cache_lock);
+
+        memcpy(ITEM_data(it), buf, res);
+        memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
+        do_item_update(it);
+    } else if (it->refcount > 1) {
         item *new_it;
-        new_it = item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2 );
+        new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2, hv);
         if (new_it == 0) {
             do_item_remove(it);
             return EOM;
@@ -3174,16 +3250,15 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
         // returning the CAS of the old item below.
         ITEM_set_cas(it, (settings.use_cas) ? ITEM_get_cas(new_it) : 0);
         do_item_remove(new_it);       /* release our reference */
-    } else { /* replace in-place */
-        /* When changing the value without replacing the item, we
-           need to update the CAS on the existing item. */
-        mutex_lock(&cache_lock); /* FIXME */
-        ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
-        pthread_mutex_unlock(&cache_lock);
-
-        memcpy(ITEM_data(it), buf, res);
-        memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
-        do_item_update(it);
+    } else {
+        /* Should never get here. This means we somehow fetched an unlinked
+         * item. TODO: Add a counter? */
+        if (settings.verbose) {
+            fprintf(stderr, "Tried to do incr/decr on invalid item\n");
+    }
+        if (it->refcount == 1)
+            do_item_remove(it);
+        return DELTA_ITEM_NOT_FOUND;
     }
 
 #ifdef USE_REPLICATION
@@ -3281,9 +3356,9 @@ static void process_slabs_automove_command(conn *c, token_t *tokens, const size_
 
     level = strtoul(tokens[2].value, NULL, 10);
     if (level == 0) {
-        settings.slab_automove = false;
-    } else if (level == 1) {
-        settings.slab_automove = true;
+        settings.slab_automove = 0;
+    } else if (level == 1 || level == 2) {
+        settings.slab_automove = level;
     } else {
         out_string(c, "ERROR");
         return;
@@ -3389,6 +3464,12 @@ static void process_command(conn *c, char *command) {
             pthread_mutex_unlock(&c->thread->stats.mutex);
         }
 
+        if (!settings.flush_enabled) {
+            // flush_all is not allowed but we log it on stats
+            out_string(c, "CLIENT_ERROR flush_all not allowed");
+            return;
+        }
+
         if(ntokens == (c->noreply ? 3 : 2)) {
 #ifdef USE_REPLICATION
             if( c != rep_conn )
@@ -3433,6 +3514,15 @@ static void process_command(conn *c, char *command) {
 
         conn_set_state(c, conn_closing);
 
+    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "shutdown") == 0)) {
+
+        if (settings.shutdown_command) {
+            conn_set_state(c, conn_closing);
+            raise(SIGINT);
+        } else {
+            out_string(c, "ERROR: shutdown not enabled");
+        }
+
     } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "slabs") == 0) {
         if (ntokens == 5 && strcmp(tokens[COMMAND_TOKEN + 1].value, "reassign") == 0) {
             int src, dst, rv;
@@ -3463,12 +3553,6 @@ static void process_command(conn *c, char *command) {
                 break;
             case REASSIGN_NOSPARE:
                 out_string(c, "NOSPARE source class has no spare pages");
-                break;
-            case REASSIGN_DEST_NOT_FULL:
-                out_string(c, "NOTFULL dest class has spare memory");
-                break;
-            case REASSIGN_SRC_NOT_SAFE:
-                out_string(c, "UNSAFE src class is in an unsafe state");
                 break;
             case REASSIGN_SRC_DST_SAME:
                 out_string(c, "SAME src and dst class are identical");
@@ -3632,7 +3716,8 @@ static enum try_read_result try_read_udp(conn *c) {
 
     c->request_addr_size = sizeof(c->request_addr);
     res = recvfrom(c->sfd, c->rbuf, c->rsize,
-                   0, &c->request_addr, &c->request_addr_size);
+                   0, (struct sockaddr *)&c->request_addr,
+                   &c->request_addr_size);
     if (res > 8) {
         unsigned char *buf = (unsigned char *)c->rbuf;
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -3691,8 +3776,12 @@ static enum try_read_result try_read_network(conn *c) {
             ++num_allocs;
             char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
             if (!new_rbuf) {
-                if (settings.verbose > 0)
+                STATS_LOCK();
+                stats.malloc_fails++;
+                STATS_UNLOCK();
+                if (settings.verbose > 0) {
                     fprintf(stderr, "Couldn't realloc input buffer\n");
+                }
                 c->rbytes = 0; /* ignore what we read */
                 out_string(c, "SERVER_ERROR out of memory reading request");
                 c->write_and_go = conn_closing;
@@ -3849,12 +3938,17 @@ static enum transmit_result transmit(conn *c) {
 
 static void drive_machine(conn *c) {
     bool stop = false;
-    int sfd, flags = 1;
+    int sfd;
     socklen_t addrlen;
     struct sockaddr_storage addr;
     int nreqs = settings.reqs_per_event;
     int res;
     const char *str;
+#ifdef HAVE_ACCEPT4
+    static int  use_accept4 = 1;
+#else
+    static int  use_accept4 = 0;
+#endif
 
     assert(c != NULL);
 
@@ -3872,7 +3966,21 @@ static void drive_machine(conn *c) {
         switch(c->state) {
         case conn_listening:
             addrlen = sizeof(addr);
-            if ((sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen)) == -1) {
+#ifdef HAVE_ACCEPT4
+            if (use_accept4) {
+                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+            } else {
+                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+            }
+#else
+            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+#endif
+            if (sfd == -1) {
+                if (use_accept4 && errno == ENOSYS) {
+                    use_accept4 = 0;
+                    continue;
+                }
+                perror(use_accept4 ? "accept4()" : "accept()");
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     /* these are transient, so don't log anything */
                     stop = true;
@@ -3887,11 +3995,12 @@ static void drive_machine(conn *c) {
                 }
                 break;
             }
-            if ((flags = fcntl(sfd, F_GETFL, 0)) < 0 ||
-                fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            if (!use_accept4) {
+                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
                 perror("setting O_NONBLOCK");
                 close(sfd);
                 break;
+            }
             }
 
             if (settings.maxconns_fast &&
@@ -3973,6 +4082,7 @@ static void drive_machine(conn *c) {
                         if (settings.verbose > 0)
                             fprintf(stderr, "Couldn't update event\n");
                         conn_set_state(c, conn_closing);
+                        break;
                     }
                 }
                 stop = true;
@@ -3984,6 +4094,16 @@ static void drive_machine(conn *c) {
                 complete_nread(c);
                 break;
             }
+
+            /* Check if rbytes < 0, to prevent crash */
+            if (c->rlbytes < 0) {
+                if (settings.verbose) {
+                    fprintf(stderr, "Invalid rlbytes to read: len %d\n", c->rlbytes);
+                }
+                conn_set_state(c, conn_closing);
+                break;
+            }
+
             /* first check if we have leftovers in the conn_read buffer */
             if (c->rbytes > 0) {
                 int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
@@ -4732,6 +4852,7 @@ static void usage(void) {
     printf("-p <num>      TCP port number to listen on (default: 11211)\n"
            "-U <num>      UDP port number to listen on (default: 11211, 0 is off)\n"
            "-s <file>     UNIX socket path to listen on (disables network support)\n"
+           "-A            enable ascii \"shutdown\" command\n"
            "-a <mask>     access mask for UNIX socket, in octal (default: 0700)\n"
            "-l <addr>     interface to listen on (default: INADDR_ANY, all addresses)\n"
            "              <addr> may be specified as host:port. If you don't specify\n"
@@ -4781,6 +4902,7 @@ static void usage(void) {
 #ifdef ENABLE_SASL
     printf("-S            Turn on Sasl authentication\n");
 #endif
+    printf("-F            Disable flush_all command\n");
 #ifdef USE_REPLICATION
     printf("-x <ip_addr>  hostname or IP address of peer repcached\n");
     printf("-X <num>      TCP port number for replication (default: 11212)\n");
@@ -4792,6 +4914,9 @@ static void usage(void) {
            "                table should be. Can be grown at runtime if not big enough.\n"
            "                Set this based on \"STAT hash_power_level\" before a \n"
            "                restart.\n"
+           "              - tail_repair_time: Time in seconds that indicates how long to wait before\n"
+           "                forcefully taking over the LRU tail item whose refcount has leaked.\n"
+           "                The default is 3 hours.\n"
            );
     return;
 }
@@ -4882,15 +5007,28 @@ static void save_pid(const char *pid_file) {
         }
     }
 
-    if ((fp = fopen(pid_file, "w")) == NULL) {
-        vperror("Could not open the pid file %s for writing", pid_file);
+    /* Create the pid file first with a temporary name, then
+     * atomically move the file to the real name to avoid a race with
+     * another process opening the file to read the pid, but finding
+     * it empty.
+     */
+    char tmp_pid_file[1024];
+    snprintf(tmp_pid_file, sizeof(tmp_pid_file), "%s.tmp", pid_file);
+
+    if ((fp = fopen(tmp_pid_file, "w")) == NULL) {
+        vperror("Could not open the pid file %s for writing", tmp_pid_file);
         return;
     }
 
     fprintf(fp,"%ld\n", (long)getpid());
     if (fclose(fp) == -1) {
-        vperror("Could not close the pid file %s", pid_file);
+        vperror("Could not close the pid file %s", tmp_pid_file);
     }
+
+    if (rename(tmp_pid_file, pid_file) != 0) {
+        vperror("Could not rename the pid file from %s to %s",
+                tmp_pid_file, pid_file);
+}
 }
 
 static void remove_pidfile(const char *pid_file) {
@@ -4979,7 +5117,7 @@ static int enable_large_pages(void) {
 
     return ret;
 #else
-    return 0;
+    return -1;
 #endif
 }
 
@@ -5089,13 +5227,15 @@ int main (int argc, char **argv) {
         MAXCONNS_FAST = 0,
         HASHPOWER_INIT,
         SLAB_REASSIGN,
-        SLAB_AUTOMOVE
+        SLAB_AUTOMOVE,
+        TAIL_REPAIR_TIME
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
         [HASHPOWER_INIT] = "hashpower",
         [SLAB_REASSIGN] = "slab_reassign",
         [SLAB_AUTOMOVE] = "slab_automove",
+        [TAIL_REPAIR_TIME] = "tail_repair_time",
         NULL
     };
 
@@ -5115,6 +5255,7 @@ int main (int argc, char **argv) {
     /* process arguments */
     while (-1 != (c = getopt(argc, argv,
           "a:"  /* access mask for unix socket */
+          "A"  /* enable admin shutdown commannd */
           "p:"  /* TCP port number to listen on */
           "s:"  /* unix socket path to listen on */
           "U:"  /* UDP port number to listen on */
@@ -5140,6 +5281,7 @@ int main (int argc, char **argv) {
           "B:"  /* Binding protocol */
           "I:"  /* Max item size */
           "S"   /* Sasl ON */
+          "F"   /* Disable flush_all */
 #ifdef USE_REPLICATION
           "X:"  /* replication port */
           "x:"  /* replication master */
@@ -5148,6 +5290,11 @@ int main (int argc, char **argv) {
           "o:"  /* Extended generic options */
         ))) {
         switch (c) {
+        case 'A':
+            /* enables "shutdown" command */
+            settings.shutdown_command = true;
+            break;
+
         case 'a':
             /* access for unix domain socket, as octal mask (like chmod)*/
             settings.access= strtol(optarg,NULL,8);
@@ -5261,6 +5408,10 @@ int main (int argc, char **argv) {
         case 'L' :
             if (enable_large_pages() == 0) {
                 preallocate = true;
+            } else {
+                fprintf(stderr, "Cannot enable large pages on this system\n"
+                    "(There is no Linux support as of this version)\n");
+                return 1;
             }
             break;
         case 'C' :
@@ -5345,6 +5496,9 @@ int main (int argc, char **argv) {
 #endif
             settings.sasl = true;
             break;
+       case 'F' :
+            settings.flush_enabled = false;
+            break;
         case 'o': /* It's sub-opts time! */
             subopts = optarg;
 
@@ -5375,7 +5529,26 @@ int main (int argc, char **argv) {
                 settings.slab_reassign = true;
                 break;
             case SLAB_AUTOMOVE:
-                settings.slab_automove = true;
+                if (subopts_value == NULL) {
+                    settings.slab_automove = 1;
+                break;
+                }
+                settings.slab_automove = atoi(subopts_value);
+                if (settings.slab_automove < 0 || settings.slab_automove > 2) {
+                    fprintf(stderr, "slab_automove must be between 0 and 2\n");
+                    return 1;
+                }
+                break;
+            case TAIL_REPAIR_TIME:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing numeric argument for tail_repair_time\n");
+                    return 1;
+                }
+                settings.tail_repair_time = atoi(subopts_value);
+                if (settings.tail_repair_time < 10) {
+                    fprintf(stderr, "Cannot set tail_repair_time to less than 10 seconds\n");
+                    return 1;
+                }
                 break;
             default:
                 printf("Illegal suboption \"%s\"\n", subopts_value);
